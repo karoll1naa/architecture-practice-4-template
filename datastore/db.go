@@ -9,42 +9,100 @@ import (
 	"path/filepath"
 )
 
-const outFileName = "current-data"
+const (
+	outFile          = "segment-"
+	MaxSizeofSegment = 1024 * 1024 * 10
+)
 
 var ErrNotFound = fmt.Errorf("record does not exist")
 
 type hashIndex map[string]int64
 
-type Db struct {
+type Segment struct {
 	out       *os.File
 	outPath   string
 	outOffset int64
+	index     hashIndex
+}
 
-	index hashIndex
+type Db struct {
+	segments       []*Segment
+	currentSegment *Segment
+	dir            string
 }
 
 func NewDb(dir string) (*Db, error) {
-	outputPath := filepath.Join(dir, outFileName)
-	f, err := os.OpenFile(outputPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	db := &Db{
+		dir: dir,
+	}
+	err := db.loadSegments()
 	if err != nil {
 		return nil, err
 	}
-	db := &Db{
-		outPath: outputPath,
-		out:     f,
-		index:   make(hashIndex),
-	}
-	err = db.recover()
-	if err != nil && err != io.EOF {
+	err = db.openCurrentSegment()
+	if err != nil {
 		return nil, err
 	}
 	return db, nil
 }
 
+func (db *Db) loadSegments() error {
+	files, err := filepath.Glob(filepath.Join(db.dir, outFile+"*"))
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		segment, err := db.loadSegment(file)
+		if err != nil {
+			return err
+		}
+		db.segments = append(db.segments, segment)
+	}
+
+	return nil
+}
+
+func (db *Db) loadSegment(path string) (*Segment, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+
+	segment := &Segment{
+		out:     file,
+		outPath: path,
+		index:   make(hashIndex),
+	}
+
+	err = segment.recover()
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	return segment, nil
+}
+
+func (db *Db) openCurrentSegment() error {
+	path := filepath.Join(db.dir, fmt.Sprintf("%s%d", outFile, len(db.segments)))
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+
+	db.currentSegment = &Segment{
+		out:     file,
+		outPath: path,
+		index:   make(hashIndex),
+	}
+	db.segments = append(db.segments, db.currentSegment)
+	return nil
+}
+
 const bufSize = 8192
 
-func (db *Db) recover() error {
-	input, err := os.Open(db.outPath)
+func (s *Segment) recover() error {
+	input, err := os.Open(s.outPath)
 	if err != nil {
 		return err
 	}
@@ -78,37 +136,44 @@ func (db *Db) recover() error {
 			if n != int(size) {
 				return fmt.Errorf("corrupted file")
 			}
-
 			var e entry
 			e.Decode(data)
-			db.index[e.key] = db.outOffset
-			db.outOffset += int64(n)
+			s.index[e.key] = s.outOffset
+			s.outOffset += int64(n)
+		} else if err == io.EOF {
+			break
+		} else {
+			return err
 		}
 	}
-	return err
+	return nil
 }
 
 func (db *Db) Close() error {
-	return db.out.Close()
+	for _, segment := range db.segments {
+		err := segment.out.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (db *Db) Get(key string) (string, error) {
-	position, ok := db.index[key]
-	if !ok {
-		return "", ErrNotFound
+	for i := len(db.segments) - 1; i >= 0; i-- {
+		segment := db.segments[i]
+		position, ok := segment.index[key]
+		if ok {
+			return segment.readFromPosition(position)
+		}
 	}
-
-	file, err := os.Open(db.outPath)
+	return "", ErrNotFound
+}
+func (s *Segment) readFromPosition(position int64) (string, error) {
+	file, err := os.Open(s.outPath)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
-
-	_, err = file.Seek(position, 0)
-	if err != nil {
-		return "", err
-	}
-
 	reader := bufio.NewReader(file)
 	value, err := readValue(reader)
 	if err != nil {
@@ -122,10 +187,25 @@ func (db *Db) Put(key, value string) error {
 		key:   key,
 		value: value,
 	}
-	n, err := db.out.Write(e.Encode())
-	if err == nil {
-		db.index[key] = db.outOffset
-		db.outOffset += int64(n)
+	data := e.Encode()
+	n, err := db.currentSegment.out.Write(data)
+	if err != nil {
+		return err
 	}
-	return err
+	db.currentSegment.index[key] = db.currentSegment.outOffset
+	db.currentSegment.outOffset += int64(n)
+	if db.currentSegment.outOffset >= MaxSizeofSegment {
+		err = db.rotateSegment()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (db *Db) rotateSegment() error {
+	err := db.currentSegment.out.Close()
+	if err != nil {
+		return err
+	}
+	return db.openCurrentSegment()
 }
