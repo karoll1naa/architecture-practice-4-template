@@ -25,6 +25,11 @@ type writeRequest struct {
 	resp  chan error
 }
 
+type deleteRequest struct {
+	key  string
+	resp chan error
+}
+
 type Segment struct {
 	out       *os.File
 	outPath   string
@@ -38,6 +43,7 @@ type Db struct {
 	currentSegment *Segment
 	dir            string
 	writeCh        chan writeRequest
+	deleteCh       chan deleteRequest
 	wg             sync.WaitGroup
 	mu             sync.Mutex
 	closed         bool
@@ -45,8 +51,9 @@ type Db struct {
 
 func NewDb(dir string) (*Db, error) {
 	db := &Db{
-		dir:     dir,
-		writeCh: make(chan writeRequest),
+		dir:      dir,
+		writeCh:  make(chan writeRequest),
+		deleteCh: make(chan deleteRequest),
 	}
 	err := db.loadSegments()
 	if err != nil {
@@ -169,6 +176,7 @@ func (db *Db) Close() error {
 	}
 	db.closed = true
 	close(db.writeCh)
+	close(db.deleteCh)
 	db.mu.Unlock()
 	db.wg.Wait()
 	for _, segment := range db.segments {
@@ -194,12 +202,18 @@ func (db *Db) Get(key string) (string, error) {
 	}
 	return "", ErrNotFound
 }
+
 func (s *Segment) readFromPosition(position int64) (string, error) {
 	file, err := os.Open(s.outPath)
 	if err != nil {
 		return "", err
 	}
+	defer file.Close()
 	reader := bufio.NewReader(file)
+	_, err = file.Seek(position, io.SeekStart)
+	if err != nil {
+		return "", err
+	}
 	value, err := readValue(reader)
 	if err != nil {
 		return "", err
@@ -211,11 +225,12 @@ func (db *Db) Put(key, value string) error {
 	req := writeRequest{
 		key:   key,
 		value: value,
-		resp:  make(chan error, 1), // Ensure the channel is buffered to prevent deadlock
+		resp:  make(chan error, 1),
 	}
 	db.writeCh <- req
 	return <-req.resp
 }
+
 func (db *Db) put(key, value string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -228,6 +243,7 @@ func (db *Db) put(key, value string) error {
 	if err != nil {
 		return err
 	}
+
 	db.currentSegment.mu.Lock()
 	db.currentSegment.index[key] = db.currentSegment.outOffset
 	db.currentSegment.outOffset += int64(n)
@@ -240,6 +256,7 @@ func (db *Db) put(key, value string) error {
 	}
 	return nil
 }
+
 func (db *Db) rotateSegment() error {
 	err := db.currentSegment.out.Close()
 	if err != nil {
@@ -247,11 +264,58 @@ func (db *Db) rotateSegment() error {
 	}
 	return db.openCurrentSegment()
 }
+
+func (db *Db) Delete(key string) error {
+	req := deleteRequest{
+		key:  key,
+		resp: make(chan error, 1),
+	}
+	db.deleteCh <- req
+	return <-req.resp
+}
+
+func (db *Db) delete(key string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.Get(key)
+	if err != nil {
+		return err
+	}
+	e := entry{
+		key:   key,
+		value: "",
+	}
+	data := e.Encode()
+	n, err := db.currentSegment.out.Write(data)
+	if err != nil {
+		return err
+	}
+
+	db.currentSegment.mu.Lock()
+	delete(db.currentSegment.index, key)
+	db.currentSegment.outOffset += int64(n)
+	db.currentSegment.mu.Unlock()
+	if db.currentSegment.outOffset >= MaxSizeofSegment {
+		err = db.rotateSegment()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (db *Db) writeWorker() {
 	defer db.wg.Done()
-	for req := range db.writeCh {
-		err := db.put(req.key, req.value)
-		req.resp <- err
-		close(req.resp)
+	for {
+		select {
+		case req := <-db.writeCh:
+			err := db.put(req.key, req.value)
+			req.resp <- err
+			close(req.resp)
+		case req := <-db.deleteCh:
+			err := db.delete(req.key)
+			req.resp <- err
+			close(req.resp)
+		}
 	}
 }
