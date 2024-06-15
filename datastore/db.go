@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -18,31 +19,42 @@ var ErrNotFound = fmt.Errorf("record does not exist")
 
 type hashIndex map[string]int64
 
+type writeRequest struct {
+	key   string
+	value string
+	resp  chan error
+}
+
 type Segment struct {
 	out       *os.File
 	outPath   string
 	outOffset int64
 	index     hashIndex
+	mu        sync.Mutex
 }
 
 type Db struct {
 	segments       []*Segment
 	currentSegment *Segment
 	dir            string
+	writeCh        chan writeRequest
+	wg             sync.WaitGroup
+	mu             sync.Mutex
+	closed         bool
 }
 
 func NewDb(dir string) (*Db, error) {
 	db := &Db{
-		dir: dir,
+		dir:     dir,
+		writeCh: make(chan writeRequest),
 	}
 	err := db.loadSegments()
 	if err != nil {
 		return nil, err
 	}
-	err = db.openCurrentSegment()
-	if err != nil {
-		return nil, err
-	}
+
+	db.wg.Add(1)
+	go db.writeWorker()
 	return db, nil
 }
 
@@ -150,6 +162,15 @@ func (s *Segment) recover() error {
 }
 
 func (db *Db) Close() error {
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return nil
+	}
+	db.closed = true
+	close(db.writeCh)
+	db.mu.Unlock()
+	db.wg.Wait()
 	for _, segment := range db.segments {
 		err := segment.out.Close()
 		if err != nil {
@@ -160,9 +181,13 @@ func (db *Db) Close() error {
 }
 
 func (db *Db) Get(key string) (string, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	for i := len(db.segments) - 1; i >= 0; i-- {
 		segment := db.segments[i]
+		segment.mu.Lock()
 		position, ok := segment.index[key]
+		segment.mu.Unlock()
 		if ok {
 			return segment.readFromPosition(position)
 		}
@@ -183,6 +208,17 @@ func (s *Segment) readFromPosition(position int64) (string, error) {
 }
 
 func (db *Db) Put(key, value string) error {
+	req := writeRequest{
+		key:   key,
+		value: value,
+		resp:  make(chan error, 1), // Ensure the channel is buffered to prevent deadlock
+	}
+	db.writeCh <- req
+	return <-req.resp
+}
+func (db *Db) put(key, value string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	e := entry{
 		key:   key,
 		value: value,
@@ -192,8 +228,10 @@ func (db *Db) Put(key, value string) error {
 	if err != nil {
 		return err
 	}
+	db.currentSegment.mu.Lock()
 	db.currentSegment.index[key] = db.currentSegment.outOffset
 	db.currentSegment.outOffset += int64(n)
+	db.currentSegment.mu.Unlock()
 	if db.currentSegment.outOffset >= MaxSizeofSegment {
 		err = db.rotateSegment()
 		if err != nil {
@@ -208,4 +246,12 @@ func (db *Db) rotateSegment() error {
 		return err
 	}
 	return db.openCurrentSegment()
+}
+func (db *Db) writeWorker() {
+	defer db.wg.Done()
+	for req := range db.writeCh {
+		err := db.put(req.key, req.value)
+		req.resp <- err
+		close(req.resp)
+	}
 }
