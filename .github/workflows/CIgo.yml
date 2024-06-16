@@ -14,7 +14,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
 
+      - name: Build Docker image and run unit tests
+        run: docker-compose build
+
       - name: Running integration test
         run: docker-compose -f docker-compose.yaml -f docker-compose.test.yaml up --exit-code-from test
       - name: Running unit test
-        run: go test -v ./cmd/lb
+        run: go test -v ./...
