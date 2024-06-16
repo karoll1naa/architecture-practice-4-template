@@ -60,9 +60,17 @@ func (s *BalancerSuite) TestHealthChecker(c *check.C) {
 
 	healthChecker.StartHealthCheck()
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	c.Assert(healthChecker.GetHealthyServers()[0], check.Equals, "2")
 	c.Assert(healthChecker.GetHealthyServers()[1], check.Equals, "3")
 	c.Assert(len(healthChecker.GetHealthyServers()), check.Equals, 2)
+}
+
+func (s *BalancerSuite) TestScheme(c *check.C) {
+	*https = true
+	c.Assert(scheme(), check.Equals, "https")
+
+	*https = false
+	c.Assert(scheme(), check.Equals, "http")
 }

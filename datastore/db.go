@@ -1,186 +1,148 @@
 package datastore
 
 import (
-	"bufio"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"sync"
+	"regexp"
+	"sort"
+	"strconv"
 )
 
 const (
-	outFile          = "segment-"
-	MaxSizeofSegment = 1024 * 1024 * 10
+	outFile = "segment-"
 )
 
-var ErrNotFound = fmt.Errorf("record does not exist")
-
-type hashIndex map[string]int64
-
-type writeRequest struct {
-	key   string
-	value string
-	resp  chan error
-}
-
-type deleteRequest struct {
-	key  string
-	resp chan error
-}
-
-type Segment struct {
-	out       *os.File
-	outPath   string
-	outOffset int64
-	index     hashIndex
-	mu        sync.Mutex
-}
+const OutfileSize int64 = 10000000
 
 type Db struct {
-	segments       []*Segment
-	currentSegment *Segment
-	dir            string
-	writeCh        chan writeRequest
-	deleteCh       chan deleteRequest
-	wg             sync.WaitGroup
-	mu             sync.Mutex
-	closed         bool
+	blocks        []*block
+	dir           string
+	segmentName   string
+	segmentNumber int
+	segmentSize   int64
 }
 
 func NewDb(dir string) (*Db, error) {
 	db := &Db{
-		dir:      dir,
-		writeCh:  make(chan writeRequest),
-		deleteCh: make(chan deleteRequest),
+		dir:         dir,
+		segmentName: outFile,
+		segmentSize: OutfileSize,
 	}
-	err := db.loadSegments()
+
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		os.MkdirAll(dir, os.ModePerm)
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	filesNames, err := f.Readdirnames(0)
 	if err != nil {
 		return nil, err
 	}
 
-	db.wg.Add(1)
-	go db.writeWorker()
+	if len(filesNames) != 0 {
+		err := db.recover(filesNames)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		err = db.addNewBlockToDb()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return db, nil
 }
 
-func (db *Db) loadSegments() error {
-	files, err := filepath.Glob(filepath.Join(db.dir, outFile+"*"))
+func (db *Db) addNewBlockToDb() error {
+	db.segmentNumber++
+	b, err := newBlock(db.dir, db.segmentName+strconv.Itoa((db.segmentNumber)))
 	if err != nil {
 		return err
 	}
-
-	for _, file := range files {
-		segment, err := db.loadSegment(file)
-		if err != nil {
-			return err
-		}
-		db.segments = append(db.segments, segment)
-	}
-
+	db.blocks = append(db.blocks, b)
 	return nil
 }
 
-func (db *Db) loadSegment(path string) (*Segment, error) {
-	file, err := os.OpenFile(path, os.O_RDONLY, 0o600)
-	if err != nil {
-		return nil, err
-	}
+func (db *Db) recover(filesNames []string) error {
+	sort.Strings(filesNames)
+	r, _ := regexp.Compile(db.segmentName + "[0-9]+")
+	for _, fileName := range filesNames {
+		match := r.MatchString(fileName)
 
-	segment := &Segment{
-		out:     file,
-		outPath: path,
-		index:   make(hashIndex),
-	}
-
-	err = segment.recover()
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-
-	return segment, nil
-}
-
-func (db *Db) openCurrentSegment() error {
-	path := filepath.Join(db.dir, fmt.Sprintf("%s%d", outFile, len(db.segments)))
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
-	if err != nil {
-		return err
-	}
-
-	db.currentSegment = &Segment{
-		out:     file,
-		outPath: path,
-		index:   make(hashIndex),
-	}
-	db.segments = append(db.segments, db.currentSegment)
-	return nil
-}
-
-const bufSize = 8192
-
-func (s *Segment) recover() error {
-	input, err := os.Open(s.outPath)
-	if err != nil {
-		return err
-	}
-	defer input.Close()
-
-	var buf [bufSize]byte
-	in := bufio.NewReaderSize(input, bufSize)
-	for err == nil {
-		var (
-			header, data []byte
-			n            int
-		)
-		header, err = in.Peek(bufSize)
-		if err == io.EOF {
-			if len(header) == 0 {
+		if match {
+			b, err := newBlock(db.dir, fileName)
+			if err != nil {
 				return err
 			}
-		} else if err != nil {
-			return err
-		}
-		size := binary.LittleEndian.Uint32(header)
-
-		if size < bufSize {
-			data = buf[:size]
-		} else {
-			data = make([]byte, size)
-		}
-		n, err = in.Read(data)
-
-		if err == nil {
-			if n != int(size) {
-				return fmt.Errorf("corrupted file")
+			db.blocks = append(db.blocks, b)
+			reg, _ := regexp.Compile("[0-9]+")
+			db.segmentNumber, err = strconv.Atoi(reg.FindString(fileName))
+			if err != nil {
+				return err
 			}
-			var e entry
-			e.Decode(data)
-			s.index[e.key] = s.outOffset
-			s.outOffset += int64(n)
-		} else if err == io.EOF {
-			break
 		} else {
-			return err
+			return fmt.Errorf("wrongly named file in the working directory: %v. Current file neme pattern: %v + int number", fileName, db.segmentName)
 		}
 	}
 	return nil
 }
 
 func (db *Db) Close() error {
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
+	for _, block := range db.blocks {
+		block.close()
+	}
+	return nil
+}
+
+func (db *Db) getType(key string) (string, string, error) {
+	var val, vType string
+	var err error
+	for j := len(db.blocks) - 1; j >= 0; j = j - 1 {
+		val, vType, err = db.blocks[j].get(key)
+		if err != nil && err != ErrNotFound {
+			return "", "", err
+		}
+		if vType == "delete" {
+			return "", "delete", nil
+		}
+		if val != "" {
+			return val, vType, nil
+		}
+	}
+	return "", "", err
+}
+
+func (db *Db) putType(key, vType, value string) error {
+	actBlock := db.blocks[len(db.blocks)-1]
+	curSize, err := actBlock.size()
+	if err != nil {
+		return err
+	}
+	if curSize <= db.segmentSize {
+		err := actBlock.put(key, vType, value)
+		if err != nil {
+			return err
+		}
 		return nil
 	}
-	db.closed = true
-	close(db.writeCh)
-	close(db.deleteCh)
-	db.mu.Unlock()
-	db.wg.Wait()
-	for _, segment := range db.segments {
-		err := segment.out.Close()
+
+	err = db.addNewBlockToDb()
+	if err != nil {
+		return err
+	}
+	err = db.blocks[len(db.blocks)-1].put(key, vType, value)
+	if err != nil {
+		return err
+	}
+
+	if len(db.blocks) > 2 {
+		err = db.merge()
 		if err != nil {
 			return err
 		}
@@ -189,133 +151,56 @@ func (db *Db) Close() error {
 }
 
 func (db *Db) Get(key string) (string, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	for i := len(db.segments) - 1; i >= 0; i-- {
-		segment := db.segments[i]
-		segment.mu.Lock()
-		position, ok := segment.index[key]
-		segment.mu.Unlock()
-		if ok {
-			return segment.readFromPosition(position)
-		}
-	}
-	return "", ErrNotFound
-}
-
-func (s *Segment) readFromPosition(position int64) (string, error) {
-	file, err := os.Open(s.outPath)
+	val, vType, err := db.getType(key)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
-	reader := bufio.NewReader(file)
-	_, err = file.Seek(position, io.SeekStart)
-	if err != nil {
-		return "", err
+	if vType == "delete" {
+		return "", fmt.Errorf("key not found")
 	}
-	value, err := readValue(reader)
-	if err != nil {
-		return "", err
+	if vType != "string" {
+		return "", fmt.Errorf("wrong type of value")
 	}
-	return value, nil
+	return val, nil
 }
 
 func (db *Db) Put(key, value string) error {
-	req := writeRequest{
-		key:   key,
-		value: value,
-		resp:  make(chan error, 1),
-	}
-	db.writeCh <- req
-	return <-req.resp
-}
-
-func (db *Db) put(key, value string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	e := entry{
-		key:   key,
-		value: value,
-	}
-	data := e.Encode()
-	n, err := db.currentSegment.out.Write(data)
+	err := db.putType(key, "string", value)
 	if err != nil {
 		return err
-	}
-
-	db.currentSegment.mu.Lock()
-	db.currentSegment.index[key] = db.currentSegment.outOffset
-	db.currentSegment.outOffset += int64(n)
-	db.currentSegment.mu.Unlock()
-	if db.currentSegment.outOffset >= MaxSizeofSegment {
-		err = db.rotateSegment()
-		if err != nil {
-			return err
-		}
 	}
 	return nil
-}
-
-func (db *Db) rotateSegment() error {
-	err := db.currentSegment.out.Close()
-	if err != nil {
-		return err
-	}
-	return db.openCurrentSegment()
 }
 
 func (db *Db) Delete(key string) error {
-	req := deleteRequest{
-		key:  key,
-		resp: make(chan error, 1),
-	}
-	db.deleteCh <- req
-	return <-req.resp
-}
-
-func (db *Db) delete(key string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	_, err := db.Get(key)
+	err := db.putType(key, "delete", "")
 	if err != nil {
 		return err
-	}
-	e := entry{
-		key:   key,
-		value: "",
-	}
-	data := e.Encode()
-	n, err := db.currentSegment.out.Write(data)
-	if err != nil {
-		return err
-	}
-
-	db.currentSegment.mu.Lock()
-	delete(db.currentSegment.index, key)
-	db.currentSegment.outOffset += int64(n)
-	db.currentSegment.mu.Unlock()
-	if db.currentSegment.outOffset >= MaxSizeofSegment {
-		err = db.rotateSegment()
-		if err != nil {
-			return err
-		}
 	}
 	return nil
 }
 
-func (db *Db) writeWorker() {
-	defer db.wg.Done()
-	for {
-		select {
-		case req := <-db.writeCh:
-			err := db.put(req.key, req.value)
-			req.resp <- err
-			close(req.resp)
-		case req := <-db.deleteCh:
-			err := db.delete(req.key)
-			req.resp <- err
-			close(req.resp)
+func (db *Db) merge() error {
+	tempBlock, err := mergeAll(db.blocks[:len(db.blocks)-1])
+	if err != nil {
+		return err
+	}
+
+	db.blocks = append(db.blocks[:1], db.blocks[:]...)
+	db.blocks[0] = tempBlock
+
+	for _, block := range db.blocks[1 : len(db.blocks)-1] {
+		err := block.deleteblock()
+		if err != nil {
+			return err
 		}
 	}
+
+	db.blocks = append(db.blocks[:1], db.blocks[len(db.blocks)-1])
+	err = os.Rename(tempBlock.segment.Name(), filepath.Join(db.dir, db.segmentName+"0"))
+	tempBlock.outPath = tempBlock.segment.Name()
+	if err != nil {
+		return err
+	}
+	return nil
 }
